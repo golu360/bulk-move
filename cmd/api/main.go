@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"opps/internal/opportunity"
 	"opps/internal/platform"
 )
 
@@ -34,6 +35,10 @@ func main() {
 
 	app := platform.NewApp(log)
 	app.Get("/healthz", platform.HealthHandler(pool))
+
+	// Everything except /healthz requires X-Workspace-Id.
+	ws := app.Group("", platform.RequireWorkspace)
+	opportunity.NewHandler(opportunity.NewService(opportunity.NewRepository(pool))).Register(ws)
 
 	go func() {
 		if err := app.Listen(":8080", fiber.ListenConfig{DisableStartupMessage: true}); err != nil {
