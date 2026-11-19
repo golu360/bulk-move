@@ -1,6 +1,6 @@
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5434/opps?sslmode=disable
 
-.PHONY: migrate-up migrate-down seed
+.PHONY: migrate-up migrate-down seed-large seed-small bench-large bench-small
 
 migrate-up:
 	docker compose run --rm migrate up
@@ -8,5 +8,17 @@ migrate-up:
 migrate-down:
 	docker compose run --rm migrate down 1
 
-seed:
-	DATABASE_URL=$(DATABASE_URL) go run ./cmd/seed -profile small -reset
+PSQL = docker compose exec -T db psql -U postgres -d opps -v ON_ERROR_STOP=1
+
+seed-large:
+	$(PSQL) < seeds/large.sql
+
+seed-small:
+	$(PSQL) < seeds/small.sql
+
+# Each bench re-seeds first, so runs are comparable.
+bench-large: seed-large
+	DATABASE_URL=$(DATABASE_URL) go run ./cmd/bench
+
+bench-small: seed-small
+	DATABASE_URL=$(DATABASE_URL) go run ./cmd/bench
