@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"opps/internal/platform"
-	"opps/internal/platform/testdb"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,7 +20,7 @@ import (
 // would still be eligible: the user's later explicit action wins.
 // Fails if the `o.version = i.snapshot_version` guard is removed.
 func TestUserEditAfterSubmitWins(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
@@ -58,7 +57,7 @@ func TestUserEditDuringChunkWins(t *testing.T) {
 	for _, commit := range []bool{true, false} {
 		name := map[bool]string{true: "user commits", false: "user rolls back"}[commit]
 		t.Run(name, func(t *testing.T) {
-			pool := testdb.New(t)
+			pool := newDB(t)
 			ctx := context.Background()
 			ws, s1, s2 := seedWorkspace(t, pool, "A")
 			s3 := addStage(t, pool, ws, 3)
@@ -141,7 +140,7 @@ func TestUserEditDuringChunkWins(t *testing.T) {
 // guard), never moves a deal twice, every item is accounted for, and every
 // deal's current stage matches its last recorded transition.
 func TestConcurrentManualMovesDuringJob(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
@@ -219,7 +218,7 @@ func TestConcurrentManualMovesDuringJob(t *testing.T) {
 // mark the job failed. Fails if the lease_token fence is removed from
 // ApplyChunk or MarkFailed.
 func TestReplacedWorkerCannotWrite(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 500)
@@ -270,7 +269,7 @@ func TestReplacedWorkerCannotWrite(t *testing.T) {
 // bug or a retry racing the original) are serialized by the fence row
 // lock: every chunk is applied exactly once.
 func TestConcurrentApplyChunkSameLeaseAppliesOnce(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 2000)
@@ -314,7 +313,7 @@ func TestConcurrentApplyChunkSameLeaseAppliesOnce(t *testing.T) {
 // 8 workers race to claim 1 pending job: exactly one wins.
 // Fails without FOR UPDATE SKIP LOCKED in Claim.
 func TestConcurrentClaimsOneWinner(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 10)
 	for i := range 20 { // the race window is small; repeat to make it bite
@@ -369,7 +368,7 @@ func raceClaims(t *testing.T, repo *Repository, n int) int {
 // transitions = moved for every job, every deal ends in the target, and no
 // workspace ever runs two jobs at the same time.
 func TestManyWorkersManyJobs(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	cfg := testConfig()
 	cfg.Workers = 4
@@ -448,7 +447,7 @@ func TestUserMoveAfterJobMovedDealApplies(t *testing.T) {
 	for _, midJob := range []bool{true, false} {
 		name := map[bool]string{true: "job still running", false: "job completed"}[midJob]
 		t.Run(name, func(t *testing.T) {
-			pool := testdb.New(t)
+			pool := newDB(t)
 			ctx := context.Background()
 			ws, s1, s2 := seedWorkspace(t, pool, "A")
 			s3 := addStage(t, pool, ws, 3)
@@ -532,7 +531,7 @@ func TestUserMoveAfterJobMovedDealApplies(t *testing.T) {
 // the first already moved (its snapshot version is stale) and moves only
 // the rest. Counts add up and no deal is moved by both.
 func TestOverlappingJobsSecondSkipsMovedDeals(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
 	s4 := addStage(t, pool, ws, 4)

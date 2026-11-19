@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"opps/internal/platform"
-	"opps/internal/platform/testdb"
 )
 
 // newApp builds the app exactly like cmd/api does.
@@ -67,7 +66,7 @@ func get(t *testing.T, app *fiber.App, workspace, path string) (*http.Response, 
 }
 
 func TestSubmitHandlerReplay(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	app := newApp(pool)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 25)
@@ -115,7 +114,7 @@ func TestSubmitHandlerReplay(t *testing.T) {
 }
 
 func TestSubmitHandlerErrors(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	app := newApp(pool)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	_, b1, _ := seedWorkspace(t, pool, "B")
@@ -191,7 +190,7 @@ func TestSubmitHandlerErrors(t *testing.T) {
 }
 
 func TestSubmitHandlerZeroMatches(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	app := newApp(pool)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	resp, raw := submit(t, app, fmt.Sprint(ws), "k",

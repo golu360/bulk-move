@@ -15,8 +15,6 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/jackc/pgx/v5/pgconn"
-
-	"opps/internal/platform/testdb"
 )
 
 // Idempotency scenarios, end to end over HTTP. Numbering follows the
@@ -92,7 +90,7 @@ func moveBody(filterStage, target int64) string {
 // ★ 2. 50 identical requests fired concurrently → all 202, one id, exactly
 // one created and 49 replays; no 409, no 500.
 func TestIdem50ConcurrentIdenticalRequests(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 2000)
 	base := serve(t, newApp(pool))
@@ -142,7 +140,7 @@ func TestIdem50ConcurrentIdenticalRequests(t *testing.T) {
 // before reading the reply. The server still commits; the client's retry
 // gets the same job, and nothing is duplicated.
 func TestIdemLostResponseThenRetry(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 2000)
 	base := serve(t, newApp(pool))
@@ -177,7 +175,7 @@ func TestIdemLostResponseThenRetry(t *testing.T) {
 // ★ 4–6. Replays during and after processing return the same job with its
 // CURRENT status, never create a second job, and never restart it.
 func TestIdemReplayThroughJobLifecycle(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
@@ -269,7 +267,7 @@ func TestIdemReplayThroughJobLifecycle(t *testing.T) {
 // 7. Same key, different body → 422 idempotency_key_reused, and the
 // original job is untouched (same hash, filter, target, total, items).
 func TestIdemKeyReusedLeavesOriginalUntouched(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
 	insertOpps(t, pool, ws, s1, 500)
@@ -313,7 +311,7 @@ func TestIdemKeyReusedLeavesOriginalUntouched(t *testing.T) {
 // too_many_matches, zero job rows, no 409 or 500. (Each attempt inserts and
 // rolls back; the next one blocked on the unique index then gets its turn.)
 func TestIdemConcurrentTooManyMatches(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, MaxItems+1)
 	base := serve(t, newApp(pool))
@@ -350,7 +348,8 @@ func TestIdemConcurrentTooManyMatches(t *testing.T) {
 // the stage guard alone cannot save them: only the version guard does.
 // Fails if the version guard is removed.
 func TestIdemRerunCompletedJobIsNoOp(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
+	skipInvariants(t) // the rewind zeroes moved while the 1000 transitions stay
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1000)
@@ -406,7 +405,8 @@ func TestIdemRerunCompletedJobIsNoOp(t *testing.T) {
 // 13. A duplicate bulk transition for the same job and deal is rejected by
 // stage_transitions_bulk_once, the backstop behind chunk atomicity.
 func TestIdemDuplicateBulkTransitionRejected(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
+	skipInvariants(t) // inserts a bulk transition by hand for a job that never ran
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1)

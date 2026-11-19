@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"opps/internal/platform/testdb"
 )
 
 // ---------------------------------------------------------------------------
@@ -22,7 +20,7 @@ import (
 // Two jobs in one workspace with two free workers: they still run one after
 // the other. [isolation: one running job per workspace]
 func TestOneRunningJobPerWorkspace(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
 	insertOpps(t, pool, ws, s1, 1000)
@@ -58,7 +56,7 @@ func TestOneRunningJobPerWorkspace(t *testing.T) {
 // the loser's 23505 is reported as "nothing to claim".
 // Fails if bulk_jobs_one_running is dropped (run with -count to see it).
 func TestConcurrentClaimsSameWorkspaceOneWinner(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
 	for i := range 20 { // the race window is small; repeat to make it bite
@@ -77,7 +75,7 @@ func TestConcurrentClaimsSameWorkspaceOneWinner(t *testing.T) {
 // Jobs in different workspaces run at the same time: one workspace's job
 // never waits for another's.
 func TestDifferentWorkspacesRunInParallel(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	var jobs []int64
 	for _, name := range []string{"A", "B"} {
 		ws, s1, s2 := seedWorkspace(t, pool, name)
@@ -102,7 +100,7 @@ func TestDifferentWorkspacesRunInParallel(t *testing.T) {
 // small workspace's job submitted later is claimed past the queued (but
 // blocked) job and finishes long before the big workspace's queue drains.
 func TestBusyWorkspaceDoesNotStarveOthers(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	big, b1, b2 := seedWorkspace(t, pool, "Big")
 	b3 := addStage(t, pool, big, 3)
 	insertOpps(t, pool, big, b1, 5000)
@@ -135,7 +133,7 @@ func TestBusyWorkspaceDoesNotStarveOthers(t *testing.T) {
 // for long: a chunk holds its row locks only for its own short transaction.
 // [isolation: chunk pacing + short transactions]
 func TestUserMovesStayFastDuringBulkJob(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
@@ -192,7 +190,7 @@ func wsFingerprint(t *testing.T, pool *pgxpool.Pool, ws int64) string {
 // re-checks workspace_id). B cannot read A's job: it gets the same 404 as
 // for a job that does not exist.
 func TestTenantIsolation(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	app := newApp(pool)
 	wsA, a1, a2 := seedWorkspace(t, pool, "A")

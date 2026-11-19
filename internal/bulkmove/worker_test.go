@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,77 @@ import (
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// newDB returns a fresh migrated database for the test and registers the
+// invariant check (checkInvariants) to run when the test ends: after the
+// test's workers have stopped (their cleanups were registered later, so
+// they run first) and before the database is dropped. Every bulk test gets
+// it without asking; tests that corrupt data on purpose opt out with
+// skipInvariants.
+func newDB(t testing.TB) *pgxpool.Pool {
+	t.Helper()
+	pool := testdb.New(t)
+	t.Cleanup(func() {
+		if t.Failed() || t.Skipped() {
+			return
+		}
+		if _, skip := invariantOptOuts.Load(t); skip {
+			invariantOptOuts.Delete(t)
+			return
+		}
+		checkInvariants(t, pool)
+	})
+	return pool
+}
+
+var invariantOptOuts sync.Map // testing.TB → struct{}
+
+// skipInvariants turns off the end-of-test invariant check for a test that
+// deliberately writes inconsistent data.
+func skipInvariants(t testing.TB) { invariantOptOuts.Store(t, struct{}{}) }
+
+// checkInvariants holds for every job in the database, whatever its status
+// (pending, mid-run, failed or completed), because progress, moves and
+// transitions only ever commit together:
+//   - moved + skipped = processed (cursor_seq), and processed <= total
+//   - bulk transitions for the job = moved
+//   - no deal has two bulk transitions for the same job
+//   - nothing outside the job's workspace was touched: every bulk
+//     transition is recorded in, and moves a deal of, the job's workspace,
+//     and is for a deal in the job's snapshot
+func checkInvariants(t testing.TB, pool *pgxpool.Pool) {
+	t.Helper()
+	checks := []struct{ name, sql string }{
+		{"moved + skipped = processed <= total", `
+			SELECT count(*) FROM bulk_jobs
+			WHERE moved + skipped <> cursor_seq OR cursor_seq > total`},
+		{"bulk transitions = moved", `
+			SELECT count(*) FROM bulk_jobs j
+			WHERE j.moved <> (SELECT count(*) FROM stage_transitions s WHERE s.bulk_job_id = j.id)`},
+		{"no deal with two bulk transitions for one job", `
+			SELECT count(*) FROM (SELECT 1 FROM stage_transitions WHERE bulk_job_id IS NOT NULL
+			                      GROUP BY bulk_job_id, opportunity_id HAVING count(*) > 1) d`},
+		{"no bulk transition outside the job's workspace", `
+			SELECT count(*) FROM stage_transitions s
+			JOIN bulk_jobs j ON j.id = s.bulk_job_id
+			JOIN opportunities o ON o.id = s.opportunity_id
+			WHERE s.workspace_id <> j.workspace_id OR o.workspace_id <> j.workspace_id`},
+		{"no bulk transition for a deal outside the snapshot", `
+			SELECT count(*) FROM stage_transitions s
+			WHERE s.bulk_job_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM bulk_job_items i
+				WHERE i.job_id = s.bulk_job_id AND i.opportunity_id = s.opportunity_id)`},
+		{"no bulk transition without its job", `
+			SELECT count(*) FROM stage_transitions s
+			WHERE s.bulk_job_id IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM bulk_jobs j WHERE j.id = s.bulk_job_id)`},
+	}
+	for _, c := range checks {
+		if n := count(t, pool, c.sql); n != 0 {
+			t.Errorf("invariant violated after test: %s (%d rows)", c.name, n)
+		}
+	}
+}
 
 // testConfig is fast: 1s lease, short timeouts, no pacing.
 func testConfig() Config {
@@ -227,7 +299,7 @@ func TestWorkerCrashMidChunkThenResume(t *testing.T) {
 		{"last chunk", 50},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pool := testdb.New(t)
+			pool := newDB(t)
 			ws, s1, s2 := seedWorkspace(t, pool, "A")
 			insertOpps(t, pool, ws, s1, 5000)
 			jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
@@ -304,7 +376,7 @@ func TestWorkerCrashMidChunkThenResume(t *testing.T) {
 // flight either committed or rolled back; a restarted worker finishes the
 // job with nothing lost or doubled.
 func TestWorkerShutdownThenRestart(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 3000)
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
@@ -336,7 +408,7 @@ func TestWorkerShutdownThenRestart(t *testing.T) {
 // A chunk that fails transiently is rolled back and retried by the same
 // worker; the retry must not double-apply anything.
 func TestChunkRetryAfterTransientFailure(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1000) // 10 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
@@ -366,7 +438,7 @@ func TestChunkRetryAfterTransientFailure(t *testing.T) {
 // keeps the committed progress, releases the lease, and is never claimed
 // again. The workspace is then free for its next job.
 func TestChunkRetryExhaustedMarksJobFailed(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)
 	insertOpps(t, pool, ws, s1, 1000)
@@ -414,7 +486,7 @@ func TestChunkRetryExhaustedMarksJobFailed(t *testing.T) {
 // chunk times out and rolls back, is retried, and once the user commits
 // (bumping version) the deal is skipped and the rest move.
 func TestChunkRetryOnLockTimeout(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	s3 := addStage(t, pool, ws, 3)

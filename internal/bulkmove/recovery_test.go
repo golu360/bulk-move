@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"opps/internal/platform/testdb"
 )
 
 // ---------------------------------------------------------------------------
@@ -109,7 +107,7 @@ func watchProgress(t *testing.T, pool *pgxpool.Pool, jobID int64) (stop func() i
 // the lease expires and runs only the 13 remaining chunks; the 700
 // transitions already committed are untouched (not redone).
 func TestCrashBetweenChunksResumesFromCursor(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 2000) // 20 chunks
@@ -154,7 +152,7 @@ func TestCrashBetweenChunksResumesFromCursor(t *testing.T) {
 // job sits "running" with a lease and no progress; after the lease expires
 // another worker claims it and runs it from the start.
 func TestCrashAfterClaimBeforeFirstChunk(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1000)
@@ -189,7 +187,7 @@ func TestCrashAfterClaimBeforeFirstChunk(t *testing.T) {
 // In every case no deal is moved twice.
 func TestCrashAtEndOfJob(t *testing.T) {
 	t.Run("crash inside the last chunk", func(t *testing.T) {
-		pool := testdb.New(t)
+		pool := newDB(t)
 		ctx := context.Background()
 		ws, s1, s2 := seedWorkspace(t, pool, "A")
 		insertOpps(t, pool, ws, s1, 1000) // 10 chunks
@@ -226,7 +224,7 @@ func TestCrashAtEndOfJob(t *testing.T) {
 	})
 
 	t.Run("all chunks committed, completion not recorded", func(t *testing.T) {
-		pool := testdb.New(t)
+		pool := newDB(t)
 		ctx := context.Background()
 		ws, s1, s2 := seedWorkspace(t, pool, "A")
 		insertOpps(t, pool, ws, s1, 500)
@@ -263,7 +261,7 @@ func TestCrashAtEndOfJob(t *testing.T) {
 	})
 
 	t.Run("empty job crashed after claim", func(t *testing.T) {
-		pool := testdb.New(t)
+		pool := newDB(t)
 		ws, s1, s2 := seedWorkspace(t, pool, "A")
 		jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2) // matches nothing
 		cfg := testConfig()
@@ -283,7 +281,7 @@ func TestCrashAtEndOfJob(t *testing.T) {
 // released), and a restarted worker redoes exactly that chunk and finishes.
 // Deterministic: the hook parks chunk 10 until the context is cancelled.
 func TestGracefulShutdownMidChunk(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 3000) // 30 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
@@ -339,7 +337,7 @@ func TestGracefulShutdownMidChunk(t *testing.T) {
 // are not chunk failures: the job completes, is never marked failed, and
 // keeps no error.
 func TestRepeatedCrashesComplete(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 3000) // 30 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
@@ -369,7 +367,7 @@ func TestRepeatedCrashesComplete(t *testing.T) {
 // one job's life: a crash mid-chunk, a takeover, a graceful shutdown
 // mid-job, a crash between chunks, and the final resume.
 func TestProgressIsMonotonicAcrossCrashes(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 4000) // 40 chunks

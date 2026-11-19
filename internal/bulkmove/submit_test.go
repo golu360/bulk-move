@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"opps/internal/platform/testdb"
 	"opps/internal/stage"
 )
 
@@ -61,7 +60,7 @@ func newService(pool *pgxpool.Pool) *Service { return NewService(NewRepository(p
 // Fails without the unique index / ON CONFLICT: concurrent retries would
 // each create a job.
 func TestSubmitConcurrentSameKeyCreatesOneJob(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1000)
 	svc := newService(pool)
@@ -109,7 +108,7 @@ func TestSubmitConcurrentSameKeyCreatesOneJob(t *testing.T) {
 }
 
 func TestSubmitSameKeyDifferentBodyIsRejected(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 10)
 	svc := newService(pool)
@@ -129,7 +128,7 @@ func TestSubmitSameKeyDifferentBodyIsRejected(t *testing.T) {
 
 // Keys are per workspace: the same key in another workspace is a new job.
 func TestSubmitKeyIsScopedToWorkspace(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	wsA, a1, a2 := seedWorkspace(t, pool, "A")
 	wsB, b1, b2 := seedWorkspace(t, pool, "B")
 	svc := newService(pool)
@@ -151,7 +150,7 @@ func TestSubmitKeyIsScopedToWorkspace(t *testing.T) {
 // The hash covers the normalized request, not the raw bytes: the same
 // instant written with a different UTC offset is a replay.
 func TestSubmitReplayIgnoresTimeZoneOffset(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	svc := newService(pool)
 	ctx := context.Background()
@@ -176,7 +175,7 @@ func TestSubmitReplayIgnoresTimeZoneOffset(t *testing.T) {
 // Fails if the cap check is removed or if the job insert is not rolled back
 // with the items.
 func TestSubmitTooManyCreatesNothing(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, MaxItems+1)
 	svc := newService(pool)
@@ -204,7 +203,7 @@ func TestSubmitTooManyCreatesNothing(t *testing.T) {
 }
 
 func TestSubmitTargetStageFromOtherWorkspace(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	wsA, _, _ := seedWorkspace(t, pool, "A")
 	_, _, b2 := seedWorkspace(t, pool, "B")
 
@@ -220,7 +219,7 @@ func TestSubmitTargetStageFromOtherWorkspace(t *testing.T) {
 // The snapshot is fixed at submit: contiguous seq 1..total, versions
 // captured, and deals created afterwards are not included.
 func TestSubmitSnapshotIsFixed(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 100)
@@ -254,7 +253,7 @@ func TestSubmitSnapshotIsFixed(t *testing.T) {
 }
 
 func TestSubmitZeroMatchesCreatesEmptyJob(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	job, created, err := newService(pool).Submit(context.Background(), ws, "k",
 		Request{Filter: Filter{StageID: &s1}, TargetStageID: s2})
@@ -265,7 +264,7 @@ func TestSubmitZeroMatchesCreatesEmptyJob(t *testing.T) {
 
 // Each filter field narrows the snapshot to exactly the rows SQL would pick.
 func TestSubmitFilterSelectsMatchingDeals(t *testing.T) {
-	pool := testdb.New(t)
+	pool := newDB(t)
 	ctx := context.Background()
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	wsB, b1, _ := seedWorkspace(t, pool, "B")
