@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"opps/internal/stage"
 )
 
 type stageSpec struct {
@@ -120,19 +122,19 @@ func main() {
 func seedWorkspace(ctx context.Context, pool *pgxpool.Pool, rng *rand.Rand, ws workspaceSpec) error {
 	var workspaceID int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO workspaces (name) VALUES ($1) RETURNING id`, ws.name,
+		`INSERT INTO workspaces (name) VALUES (@name) RETURNING id`,
+		pgx.NamedArgs{"name": ws.name},
 	).Scan(&workspaceID); err != nil {
 		return fmt.Errorf("insert workspace: %w", err)
 	}
 
 	stageIDs := make([]int64, len(stageSpecs))
 	for i, s := range stageSpecs {
-		if err := pool.QueryRow(ctx,
-			`INSERT INTO stages (workspace_id, position, name) VALUES ($1, $2, $3) RETURNING id`,
-			workspaceID, i, s.name,
-		).Scan(&stageIDs[i]); err != nil {
-			return fmt.Errorf("insert stage %q: %w", s.name, err)
+		id, err := stage.Create(ctx, pool, workspaceID, i, s.name)
+		if err != nil {
+			return err
 		}
+		stageIDs[i] = id
 	}
 
 	now := time.Now().UTC()

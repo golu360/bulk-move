@@ -1,6 +1,7 @@
 package opportunity_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"opps/internal/opportunity"
 	"opps/internal/platform"
 	"opps/internal/platform/testdb"
+	"opps/internal/stage"
 )
 
 // newApp builds the app exactly like cmd/api does.
@@ -37,9 +39,8 @@ func seedWorkspace(t *testing.T, pool *pgxpool.Pool, name string) (wsID, stageID
 	if err := pool.QueryRow(ctx, `INSERT INTO workspaces (name) VALUES ($1) RETURNING id`, name).Scan(&wsID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx,
-		`INSERT INTO stages (workspace_id, position, name) VALUES ($1, 1, 'New Lead') RETURNING id`,
-		wsID).Scan(&stageID); err != nil {
+	stageID, err := stage.Create(ctx, pool, wsID, 1, "New Lead")
+	if err != nil {
 		t.Fatal(err)
 	}
 	return wsID, stageID
@@ -172,7 +173,9 @@ func TestCreateDefaultsStatusOpenAndPersists(t *testing.T) {
 }
 
 // app.Test's in-memory conn surfaces fasthttp's body-limit rejection as a
-// client error, so the 413 is checked through a real listener.
+// client error, so the 413 is checked through a real listener. fasthttp
+// rejects on Content-Length alone and closes the connection, so we send only
+// the headers: uploading the body races the close (connection reset).
 func TestCreateBodyTooLarge(t *testing.T) {
 	pool := testdb.New(t)
 	app := newApp(pool)
@@ -183,10 +186,18 @@ func TestCreateBodyTooLarge(t *testing.T) {
 	go func() { _ = app.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true}) }()
 	t.Cleanup(func() { _ = app.Shutdown() })
 
-	body := `{"name":"` + strings.Repeat("a", 1<<20) + `"}`
-	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/opportunities", strings.NewReader(body))
-	req.Header.Set("X-Workspace-Id", "1")
-	resp, err := http.DefaultClient.Do(req)
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "POST /opportunities HTTP/1.1\r\nHost: test\r\n"+
+		"X-Workspace-Id: 1\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n",
+		(1<<20)+1); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,12 +338,7 @@ func TestListStagePaginationCoversEveryRowOnce(t *testing.T) {
 	ws := fmt.Sprint(wsID)
 
 	// Noise: another stage in the same workspace, and another workspace.
-	var otherStage int64
-	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO stages (workspace_id, position, name) VALUES ($1, 2, 'Other') RETURNING id`,
-		wsID).Scan(&otherStage); err != nil {
-		t.Fatal(err)
-	}
+	otherStage := addStage(t, pool, wsID, 2)
 	insertOpps(t, pool, wsID, otherStage, 7)
 	wsB, stageB := seedWorkspace(t, pool, "B")
 	insertOpps(t, pool, wsB, stageB, 7)

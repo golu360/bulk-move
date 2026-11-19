@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"opps/internal/stage"
 )
 
 // sqlstateLockNotAvailable is raised when lock_timeout expires.
@@ -38,10 +40,17 @@ func scanOpportunity(row pgx.Row) (Opportunity, error) {
 func (r *Repository) Create(ctx context.Context, workspaceID int64, in CreateInput) (Opportunity, error) {
 	row := r.db.QueryRow(ctx, `
 		INSERT INTO opportunities (workspace_id, stage_id, name, value_cents, status, owner_id)
-		SELECT $1, $2, $3, $4, $5, $6
-		WHERE EXISTS (SELECT 1 FROM stages WHERE id = $2 AND workspace_id = $1)
+		SELECT @workspace_id, @stage_id, @name, @value_cents, @status, @owner_id
+		WHERE EXISTS (SELECT 1 FROM stages WHERE id = @stage_id AND workspace_id = @workspace_id)
 		RETURNING `+returningCols,
-		workspaceID, in.StageID, in.Name, in.ValueCents, in.Status, in.OwnerID)
+		pgx.NamedArgs{
+			"workspace_id": workspaceID,
+			"stage_id":     in.StageID,
+			"name":         in.Name,
+			"value_cents":  in.ValueCents,
+			"status":       in.Status,
+			"owner_id":     in.OwnerID,
+		})
 
 	o, err := scanOpportunity(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -55,14 +64,7 @@ func (r *Repository) Create(ctx context.Context, workspaceID int64, in CreateInp
 
 // StageExists reports whether the stage belongs to the workspace.
 func (r *Repository) StageExists(ctx context.Context, workspaceID, stageID int64) (bool, error) {
-	var exists bool
-	err := r.db.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM stages WHERE id = $1 AND workspace_id = $2)`,
-		stageID, workspaceID).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("check stage: %w", err)
-	}
-	return exists, nil
+	return stage.Exists(ctx, r.db, workspaceID, stageID)
 }
 
 // ListByStage returns up to limit opportunities in the stage with id > after,
@@ -71,10 +73,10 @@ func (r *Repository) ListByStage(ctx context.Context, workspaceID, stageID, afte
 	rows, err := r.db.Query(ctx, `
 		SELECT `+returningCols+`
 		FROM opportunities
-		WHERE workspace_id = $1 AND stage_id = $2 AND id > $3
+		WHERE workspace_id = @workspace_id AND stage_id = @stage_id AND id > @after
 		ORDER BY id
-		LIMIT $4`,
-		workspaceID, stageID, after, limit)
+		LIMIT @limit`,
+		pgx.NamedArgs{"workspace_id": workspaceID, "stage_id": stageID, "after": after, "limit": limit})
 	if err != nil {
 		return nil, fmt.Errorf("list opportunities: %w", err)
 	}
@@ -101,6 +103,7 @@ func (r *Repository) ListByStage(ctx context.Context, workspaceID, stageID, afte
 // INVARIANT: every write to opportunities must bump version. The bulk move
 // job relies on it to detect deals edited after its snapshot was taken.
 func (r *Repository) MoveOpportunity(ctx context.Context, workspaceID, id, targetStageID int64) (o Opportunity, moved bool, err error) {
+	args := pgx.NamedArgs{"id": id, "workspace_id": workspaceID, "target_stage_id": targetStageID}
 	err = pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
 		// Never queue for long behind another writer (user or bulk chunk).
 		if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', '2s', true)`); err != nil {
@@ -109,8 +112,8 @@ func (r *Repository) MoveOpportunity(ctx context.Context, workspaceID, id, targe
 
 		var fromStage int64
 		err := tx.QueryRow(ctx,
-			`SELECT stage_id FROM opportunities WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
-			id, workspaceID).Scan(&fromStage)
+			`SELECT stage_id FROM opportunities WHERE id = @id AND workspace_id = @workspace_id FOR UPDATE`,
+			args).Scan(&fromStage)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -118,29 +121,27 @@ func (r *Repository) MoveOpportunity(ctx context.Context, workspaceID, id, targe
 			return fmt.Errorf("lock opportunity: %w", err)
 		}
 
-		var stageOK bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM stages WHERE id = $1 AND workspace_id = $2)`,
-			targetStageID, workspaceID).Scan(&stageOK); err != nil {
-			return fmt.Errorf("check stage: %w", err)
+		stageOK, err := stage.Exists(ctx, tx, workspaceID, targetStageID)
+		if err != nil {
+			return err
 		}
 		if !stageOK {
 			return ErrStageNotFound
 		}
 
-		// stage_id <> $3 makes "already in the target stage" a zero-row update:
+		// stage_id <> @target_stage_id makes "already in the target stage" a zero-row update:
 		// nothing is written, version is not bumped, no transition is recorded.
 		o, err = scanOpportunity(tx.QueryRow(ctx, `
 			UPDATE opportunities
-			SET stage_id = $3, version = version + 1, updated_at = now()
-			WHERE id = $1 AND workspace_id = $2 AND stage_id <> $3
+			SET stage_id = @target_stage_id, version = version + 1, updated_at = now()
+			WHERE id = @id AND workspace_id = @workspace_id AND stage_id <> @target_stage_id
 			RETURNING `+returningCols,
-			id, workspaceID, targetStageID))
+			args))
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The row exists (we hold its lock), so no row means no-op.
 			o, err = scanOpportunity(tx.QueryRow(ctx,
-				`SELECT `+returningCols+` FROM opportunities WHERE id = $1 AND workspace_id = $2`,
-				id, workspaceID))
+				`SELECT `+returningCols+` FROM opportunities WHERE id = @id AND workspace_id = @workspace_id`,
+				args))
 			if err != nil {
 				return fmt.Errorf("read opportunity: %w", err)
 			}
@@ -153,8 +154,13 @@ func (r *Repository) MoveOpportunity(ctx context.Context, workspaceID, id, targe
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO stage_transitions
 			       (workspace_id, opportunity_id, from_stage_id, to_stage_id, source)
-			VALUES ($1, $2, $3, $4, 'manual')`,
-			workspaceID, id, fromStage, targetStageID); err != nil {
+			VALUES (@workspace_id, @id, @from_stage_id, @target_stage_id, 'manual')`,
+			pgx.NamedArgs{
+				"workspace_id":    workspaceID,
+				"id":              id,
+				"from_stage_id":   fromStage,
+				"target_stage_id": targetStageID,
+			}); err != nil {
 			return fmt.Errorf("insert transition: %w", err)
 		}
 		moved = true

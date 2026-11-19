@@ -9,14 +9,13 @@ import (
 
 	"opps/internal/opportunity"
 	"opps/internal/platform/testdb"
+	"opps/internal/stage"
 )
 
 func addStage(t *testing.T, pool *pgxpool.Pool, wsID int64, position int) int64 {
 	t.Helper()
-	var id int64
-	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO stages (workspace_id, position, name) VALUES ($1, $2, 'Stage') RETURNING id`,
-		wsID, position).Scan(&id); err != nil {
+	id, err := stage.Create(context.Background(), pool, wsID, position, "Stage")
+	if err != nil {
 		t.Fatal(err)
 	}
 	return id
