@@ -24,3 +24,8 @@ func (s *Service) Submit(ctx context.Context, workspaceID int64, key string, req
 	}
 	return s.repo.CreateJobWithSnapshot(ctx, workspaceID, key, h, req)
 }
+
+// Get returns a job of the workspace, or ErrNotFound.
+func (s *Service) Get(ctx context.Context, workspaceID, jobID int64) (JobStatus, error) {
+	return s.repo.GetJob(ctx, workspaceID, jobID)
+}

@@ -32,6 +32,28 @@ func NewHandler(svc *Service) *Handler {
 // platform.RequireWorkspace applied.
 func (h *Handler) Register(r fiber.Router) {
 	r.Post("/bulk-moves", h.Submit)
+	r.Get("/bulk-moves/:id", h.Get)
+}
+
+// Get handles GET /bulk-moves/{id}. Another workspace's job is a 404.
+func (h *Handler) Get(c fiber.Ctx) error {
+	id, err := platform.PathID(c, "id")
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), requestTimeout)
+	defer cancel()
+
+	job, err := h.svc.Get(ctx, platform.WorkspaceID(c), id)
+	switch {
+	case err == nil:
+		return c.JSON(job)
+	case errors.Is(err, ErrNotFound):
+		return platform.NotFound("bulk_move_not_found",
+			fmt.Sprintf("bulk move %d does not exist in this workspace", id))
+	default:
+		return err
+	}
 }
 
 // validKey: 1–200 printable ASCII characters.

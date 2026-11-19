@@ -52,6 +52,20 @@ func submit(t *testing.T, app *fiber.App, workspace, key, body string) (*http.Re
 	return resp, raw
 }
 
+// get sends GET path as workspace and returns the response and body.
+func get(t *testing.T, app *fiber.App, workspace, path string) (*http.Response, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("X-Workspace-Id", workspace)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp, raw
+}
+
 func TestSubmitHandlerReplay(t *testing.T) {
 	pool := testdb.New(t)
 	app := newApp(pool)

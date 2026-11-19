@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"opps/internal/platform"
 	"opps/internal/platform/testdb"
 )
 
@@ -362,42 +363,217 @@ func raceClaims(t *testing.T, repo *Repository, n int) int {
 	return wins
 }
 
-// Three worker processes (3 loops each) drain six jobs across three
-// workspaces. Every job completes exactly once with no takeovers, and no
+// Two worker instances (4 goroutines each, each with its own pool sized
+// Workers+1, like cmd/worker) drain two jobs in each of four workspaces.
+// Every job completes with no takeovers, no deal is moved twice by one job,
+// transitions = moved for every job, every deal ends in the target, and no
 // workspace ever runs two jobs at the same time.
 func TestManyWorkersManyJobs(t *testing.T) {
 	pool := testdb.New(t)
+	ctx := context.Background()
 	cfg := testConfig()
-	cfg.Workers = 3
+	cfg.Workers = 4
 	cfg.LeaseTTL = 10 * time.Second // pool contention must not look like a crash
 
-	type wsJobs struct{ first, second int64 }
+	type wsJobs struct {
+		ws, target    int64
+		first, second int64
+	}
 	var all []wsJobs
-	for i := range 3 {
+	for i := range 4 {
 		ws, s1, s2 := seedWorkspace(t, pool, fmt.Sprintf("W%d", i))
 		s3 := addStage(t, pool, ws, 3)
 		insertOpps(t, pool, ws, s1, 1000)
 		insertOpps(t, pool, ws, s3, 500)
 		all = append(all, wsJobs{
+			ws: ws, target: s2,
 			first:  submitJob(t, pool, ws, "k1", Filter{StageID: &s1}, s2),
 			second: submitJob(t, pool, ws, "k2", Filter{StageID: &s3}, s2),
 		})
 	}
-	for range 3 {
-		startWorker(t, newWorker(t, NewRepository(pool), cfg))
+	for i := range 2 {
+		wp, err := platform.NewPool(ctx, pool.Config().ConnString(), int32(cfg.Workers+1), fmt.Sprintf("bulk-worker-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(wp.Close)
+		// Registered after the pool's Close, so the worker stops first.
+		startWorker(t, newWorker(t, NewRepository(wp), cfg))
 	}
 	waitFor(t, 60*time.Second, "all jobs completed", func() bool {
-		return count(t, pool, `SELECT count(*) FROM bulk_jobs WHERE status = 'completed'`) == 6
+		return count(t, pool, `SELECT count(*) FROM bulk_jobs WHERE status = 'completed'`) == 8
 	})
 
 	for _, w := range all {
 		a, b := assertCompleted(t, pool, w.first), assertCompleted(t, pool, w.second)
-		if a.Moved != 1000 || b.Moved != 500 || a.Claims != 1 || b.Claims != 1 {
-			t.Fatalf("jobs %d/%d: moved %d/%d claims %d/%d", w.first, w.second, a.Moved, b.Moved, a.Claims, b.Claims)
+		if a.Moved != 1000 || b.Moved != 500 || a.Skipped != 0 || b.Skipped != 0 {
+			t.Fatalf("jobs %d/%d: moved %d/%d skipped %d/%d, want 1000/500 0/0",
+				w.first, w.second, a.Moved, b.Moved, a.Skipped, b.Skipped)
+		}
+		if a.Claims != 1 || b.Claims != 1 {
+			t.Fatalf("jobs %d/%d: claims %d/%d, want 1/1 (no takeovers)", w.first, w.second, a.Claims, b.Claims)
 		}
 		if !b.StartedAt.After(*a.FinishedAt) && !a.StartedAt.After(*b.FinishedAt) {
 			t.Fatalf("jobs %d and %d in one workspace overlapped: %v–%v and %v–%v",
 				w.first, w.second, a.StartedAt, a.FinishedAt, b.StartedAt, b.FinishedAt)
 		}
+		if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE workspace_id = $1 AND stage_id <> $2`, w.ws, w.target); n != 0 {
+			t.Fatalf("workspace %d: %d deals not in the target stage", w.ws, n)
+		}
+	}
+
+	// Across all jobs at once: transitions = moved per job, and no
+	// (job, deal) pair recorded twice.
+	if n := count(t, pool, `
+		SELECT count(*) FROM bulk_jobs j
+		WHERE j.moved <> (SELECT count(*) FROM stage_transitions s WHERE s.bulk_job_id = j.id)`); n != 0 {
+		t.Fatalf("%d jobs whose transition count differs from moved", n)
+	}
+	if n := count(t, pool, `
+		SELECT count(*) FROM (SELECT 1 FROM stage_transitions WHERE bulk_job_id IS NOT NULL
+		GROUP BY bulk_job_id, opportunity_id HAVING count(*) > 1) d`); n != 0 {
+		t.Fatalf("%d deals moved more than once by one job", n)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM stage_transitions WHERE source = 'bulk'`); n != 4*1500 {
+		t.Fatalf("%d bulk transitions in total, want %d", n, 4*1500)
+	}
+}
+
+// The job moves a deal first and a user moves it afterwards: the user's
+// move applies on top of the job's, the final stage is the user's, and the
+// deal's history records both transitions in order. The job never comes
+// back to the deal (its cursor is past it). Checked both while the job is
+// still running and after it completed.
+func TestUserMoveAfterJobMovedDealApplies(t *testing.T) {
+	for _, midJob := range []bool{true, false} {
+		name := map[bool]string{true: "job still running", false: "job completed"}[midJob]
+		t.Run(name, func(t *testing.T) {
+			pool := testdb.New(t)
+			ctx := context.Background()
+			ws, s1, s2 := seedWorkspace(t, pool, "A")
+			s3 := addStage(t, pool, ws, 3)
+			insertOpps(t, pool, ws, s1, 500)
+			deal := oppIDs(t, pool, s1)[0] // in chunk 1
+			jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
+			repo := NewRepository(pool)
+			cfg := testConfig()
+			cfg.LeaseTTL = 10 * time.Second
+
+			job, err := repo.Claim(ctx, "token", cfg.LeaseTTL)
+			if err != nil || job == nil {
+				t.Fatalf("claim = %+v, %v", job, err)
+			}
+			finish := func() {
+				for done := false; !done; {
+					if done, err = repo.ApplyChunk(ctx, job, cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if midJob {
+				if _, err := repo.ApplyChunk(ctx, job, cfg); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				finish()
+			}
+			if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE id = $1 AND stage_id = $2`, deal, s2); n != 1 {
+				t.Fatal("the job did not move the deal first")
+			}
+
+			if err := manualMove(ctx, pool, ws, deal, s3); err != nil {
+				t.Fatal(err)
+			}
+			if midJob {
+				finish()
+			}
+
+			j := assertCompleted(t, pool, jobID)
+			if j.Moved != 500 || j.Skipped != 0 {
+				t.Fatalf("moved=%d skipped=%d, want 500/0", j.Moved, j.Skipped)
+			}
+			if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE id = $1 AND stage_id = $2`, deal, s3); n != 1 {
+				t.Fatal("deal is not in the user's stage")
+			}
+
+			type tr struct {
+				from, to int64
+				source   string
+				job      *int64
+			}
+			rows, err := pool.Query(ctx, `
+				SELECT from_stage_id, to_stage_id, source, bulk_job_id
+				FROM stage_transitions WHERE opportunity_id = $1 ORDER BY id`, deal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []tr
+			for rows.Next() {
+				var r tr
+				if err := rows.Scan(&r.from, &r.to, &r.source, &r.job); err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, r)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 2 ||
+				got[0].source != "bulk" || got[0].from != s1 || got[0].to != s2 || got[0].job == nil || *got[0].job != jobID ||
+				got[1].source != "manual" || got[1].from != s2 || got[1].to != s3 || got[1].job != nil {
+				t.Fatalf("transitions = %+v, want [bulk %d→%d (job %d), manual %d→%d]", got, s1, s2, jobID, s2, s3)
+			}
+		})
+	}
+}
+
+// Two jobs in one workspace whose snapshots overlap, both submitted before
+// either runs. They run one after the other; the second skips every deal
+// the first already moved (its snapshot version is stale) and moves only
+// the rest. Counts add up and no deal is moved by both.
+func TestOverlappingJobsSecondSkipsMovedDeals(t *testing.T) {
+	pool := testdb.New(t)
+	ws, s1, s2 := seedWorkspace(t, pool, "A")
+	s3 := addStage(t, pool, ws, 3)
+	s4 := addStage(t, pool, ws, 4)
+	insertOpps(t, pool, ws, s1, 1000) // matched by both jobs
+	insertOpps(t, pool, ws, s4, 500)  // matched by the second job only
+
+	first := submitJob(t, pool, ws, "k1", Filter{StageID: &s1}, s2)
+	// Whole workspace, to a different stage than the first job, so the only
+	// reason to skip is the first job's version bump.
+	second := submitJob(t, pool, ws, "k2", Filter{}, s3)
+
+	cfg := testConfig()
+	cfg.Workers = 2
+	cfg.LeaseTTL = 10 * time.Second
+	startWorker(t, newWorker(t, NewRepository(pool), cfg))
+	waitFor(t, 30*time.Second, "both completed", func() bool {
+		return count(t, pool, `SELECT count(*) FROM bulk_jobs WHERE status = 'completed'`) == 2
+	})
+
+	a, b := assertCompleted(t, pool, first), assertCompleted(t, pool, second)
+	if b.StartedAt.Before(*a.FinishedAt) {
+		t.Fatalf("second job started %v before the first finished %v", b.StartedAt, a.FinishedAt)
+	}
+	if a.Total != 1000 || a.Moved != 1000 || a.Skipped != 0 {
+		t.Fatalf("first: %+v, want total=1000 moved=1000 skipped=0", a)
+	}
+	if b.Total != 1500 || b.Moved != 500 || b.Skipped != 1000 {
+		t.Fatalf("second: %+v, want total=1500 moved=500 skipped=1000", b)
+	}
+	if a.Moved+b.Moved != 1500 || b.Skipped != a.Moved {
+		t.Fatalf("counts don't add up: moved %d+%d, second skipped %d", a.Moved, b.Moved, b.Skipped)
+	}
+	if n := count(t, pool, `
+		SELECT count(*) FROM (SELECT opportunity_id FROM stage_transitions
+		WHERE bulk_job_id IN ($1, $2) GROUP BY 1 HAVING count(*) > 1) d`, first, second); n != 0 {
+		t.Fatalf("%d deals moved by both jobs", n)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE workspace_id = $1 AND stage_id = $2`, ws, s2); n != 1000 {
+		t.Fatalf("%d deals in the first job's target, want 1000", n)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE workspace_id = $1 AND stage_id = $2`, ws, s3); n != 500 {
+		t.Fatalf("%d deals in the second job's target, want 500", n)
 	}
 }

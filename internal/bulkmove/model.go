@@ -55,7 +55,21 @@ type Job struct {
 	Total  int    `json:"total"`
 }
 
-var validStatuses = map[string]bool{"open": true, "won": true, "lost": true, "abandoned": true}
+// JobStatus is what GET /bulk-moves/{id} returns: progress and outcome.
+type JobStatus struct {
+	ID            int64      `json:"id"`
+	Status        string     `json:"status"`
+	TargetStageID int64      `json:"target_stage_id"`
+	Total         int        `json:"total"`
+	Moved         int        `json:"moved"`
+	Skipped       int        `json:"skipped"`
+	LastError     *string    `json:"last_error"`
+	CreatedAt     time.Time  `json:"created_at"`
+	StartedAt     *time.Time `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at"`
+}
+
+var validStatuses =map[string]bool{"open": true, "won": true, "lost": true, "abandoned": true}
 
 func invalid(format string, a ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrInvalidFilter}, a...)...)

@@ -2,11 +2,15 @@ package bulkmove
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"opps/internal/platform/testdb"
 )
@@ -167,4 +171,111 @@ func TestUserMovesStayFastDuringBulkJob(t *testing.T) {
 	}
 	waitFor(t, 60*time.Second, "job completed", statusIs(t, pool, jobID, "completed"))
 	assertCompleted(t, pool, jobID)
+}
+
+// wsFingerprint hashes every deal of the workspace (id, stage, version,
+// updated_at): any write to any of its rows changes it.
+func wsFingerprint(t *testing.T, pool *pgxpool.Pool, ws int64) string {
+	t.Helper()
+	var h string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT coalesce(md5(string_agg(id || ':' || stage_id || ':' || version || ':' || updated_at, ',' ORDER BY id)), '')
+		FROM opportunities WHERE workspace_id = $1`, ws).Scan(&h); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// Tenant isolation: jobs in workspace A never touch workspace B's rows —
+// not with an empty (whole-workspace) filter, not with a filter naming B's
+// stage, and not even if A's snapshot somehow contained a B deal (the chunk
+// re-checks workspace_id). B cannot read A's job: it gets the same 404 as
+// for a job that does not exist.
+func TestTenantIsolation(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	app := newApp(pool)
+	wsA, a1, a2 := seedWorkspace(t, pool, "A")
+	insertOpps(t, pool, wsA, a1, 300)
+	insertOpps(t, pool, wsA, a2, 200) // already in the target: skipped
+	wsB, b1, _ := seedWorkspace(t, pool, "B")
+	insertOpps(t, pool, wsB, b1, 300)
+	before := wsFingerprint(t, pool, wsB)
+
+	allOfA := submitJob(t, pool, wsA, "all", Filter{}, a2)
+	foreignStage := submitJob(t, pool, wsA, "foreign", Filter{StageID: &b1}, a2)
+	if n := count(t, pool, `
+		SELECT count(*) FROM bulk_job_items i JOIN opportunities o ON o.id = i.opportunity_id
+		WHERE i.job_id IN ($1, $2) AND o.workspace_id <> $3`, allOfA, foreignStage, wsA); n != 0 {
+		t.Fatalf("%d of B's deals in A's snapshots", n)
+	}
+	if j := loadJob(t, pool, foreignStage); j.Total != 0 {
+		t.Fatalf("filter on B's stage matched %d deals in A", j.Total)
+	}
+
+	// Defence in depth: plant one of B's deals in A's snapshot, with a
+	// matching version. The chunk must still skip it.
+	bDeal := oppIDs(t, pool, b1)[0]
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO bulk_job_items (job_id, seq, opportunity_id, snapshot_version)
+		SELECT $1, 501, id, version FROM opportunities WHERE id = $2`, allOfA, bDeal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE bulk_jobs SET total = 501 WHERE id = $1`, allOfA); err != nil {
+		t.Fatal(err)
+	}
+
+	startWorker(t, newWorker(t, NewRepository(pool), testConfig()))
+	waitFor(t, 30*time.Second, "both completed", func() bool {
+		return count(t, pool, `SELECT count(*) FROM bulk_jobs WHERE status = 'completed'`) == 2
+	})
+	if j := assertCompleted(t, pool, allOfA); j.Moved != 300 || j.Skipped != 201 {
+		t.Fatalf("A's job: moved=%d skipped=%d, want 300/201", j.Moved, j.Skipped)
+	}
+	assertCompleted(t, pool, foreignStage)
+
+	if after := wsFingerprint(t, pool, wsB); after != before {
+		t.Fatal("A's jobs wrote to B's deals")
+	}
+	if n := count(t, pool, `
+		SELECT count(*) FROM stage_transitions s JOIN opportunities o ON o.id = s.opportunity_id
+		WHERE s.workspace_id = $1 OR o.workspace_id = $1`, wsB); n != 0 {
+		t.Fatalf("%d transitions touch B", n)
+	}
+
+	// Reads: A sees its job, B gets a 404 identical to a missing job's.
+	path := fmt.Sprintf("/bulk-moves/%d", allOfA)
+	resp, raw := get(t, app, fmt.Sprint(wsA), path)
+	if resp.StatusCode != 200 {
+		t.Fatalf("A GET own job: %d %s", resp.StatusCode, raw)
+	}
+	var js JobStatus
+	if err := json.Unmarshal(raw, &js); err != nil {
+		t.Fatal(err)
+	}
+	if js.ID != allOfA || js.Status != "completed" || js.Total != 501 || js.Moved != 300 || js.Skipped != 201 || js.FinishedAt == nil {
+		t.Fatalf("A GET own job = %+v", js)
+	}
+
+	for _, tc := range []struct {
+		name, ws, path string
+		status         int
+		code           string
+	}{
+		{"B reads A's job", fmt.Sprint(wsB), path, 404, "bulk_move_not_found"},
+		{"missing job", fmt.Sprint(wsB), "/bulk-moves/999999", 404, "bulk_move_not_found"},
+		{"invalid id", fmt.Sprint(wsB), "/bulk-moves/abc", 400, "invalid_path_param"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, raw := get(t, app, tc.ws, tc.path)
+			var e errBody
+			_ = json.Unmarshal(raw, &e)
+			if resp.StatusCode != tc.status || e.Error.Code != tc.code {
+				t.Fatalf("GET %s as %s: %d %s, want %d %s", tc.path, tc.ws, resp.StatusCode, raw, tc.status, tc.code)
+			}
+			if strings.Contains(string(raw), "completed") || strings.Contains(string(raw), `"moved"`) {
+				t.Fatalf("404 body leaks job data: %s", raw)
+			}
+		})
+	}
 }

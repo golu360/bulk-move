@@ -165,6 +165,27 @@ func (r *Repository) CreateJobWithSnapshot(ctx context.Context, workspaceID int6
 	return job, created, nil
 }
 
+// GetJob returns a job of the workspace. A job of another workspace is
+// indistinguishable from a missing one: both are ErrNotFound.
+func (r *Repository) GetJob(ctx context.Context, workspaceID, jobID int64) (JobStatus, error) {
+	var j JobStatus
+	err := r.db.QueryRow(ctx, `
+		SELECT id, status, target_stage_id, total, moved, skipped, last_error,
+		       created_at, started_at, finished_at
+		FROM bulk_jobs
+		WHERE id = @job_id AND workspace_id = @workspace_id`,
+		pgx.NamedArgs{"job_id": jobID, "workspace_id": workspaceID},
+	).Scan(&j.ID, &j.Status, &j.TargetStageID, &j.Total, &j.Moved, &j.Skipped, &j.LastError,
+		&j.CreatedAt, &j.StartedAt, &j.FinishedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return JobStatus{}, ErrNotFound
+	}
+	if err != nil {
+		return JobStatus{}, fmt.Errorf("get job: %w", err)
+	}
+	return j, nil
+}
+
 // ---------------------------------------------------------------------------
 // Worker queries: claim, apply a chunk, mark failed.
 // ---------------------------------------------------------------------------
