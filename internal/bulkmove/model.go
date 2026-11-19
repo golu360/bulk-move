@@ -17,7 +17,18 @@ var (
 	ErrBadStage      = errors.New("target stage does not exist in this workspace")
 	ErrInvalidFilter = errors.New("invalid filter")
 	ErrNotFound      = errors.New("bulk move not found")
+	// ErrLeaseLost: the job's lease token changed (another worker resumed
+	// it) or it finished. The caller must stop without writing.
+	ErrLeaseLost = errors.New("lease lost: job is owned by another worker")
 )
+
+// ClaimedJob is a job leased to one worker. Token fences every write.
+type ClaimedJob struct {
+	ID            int64
+	WorkspaceID   int64
+	TargetStageID int64
+	Token         string
+}
 
 // Filter selects the deals to move. Every field is optional; an empty
 // filter matches the whole workspace (still capped at MaxItems).
