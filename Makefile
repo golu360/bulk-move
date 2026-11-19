@@ -1,6 +1,6 @@
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5434/opps?sslmode=disable
 
-.PHONY: migrate-up migrate-down seed-large seed-small bench-large bench-small
+.PHONY: migrate-up migrate-down seed-large seed-small bench-large bench-small api worker test
 
 migrate-up:
 	docker compose run --rm migrate up
@@ -22,3 +22,13 @@ bench-large: seed-large
 
 bench-small: seed-small
 	DATABASE_URL=$(DATABASE_URL) go run ./cmd/bench
+
+api:
+	DATABASE_URL=$(DATABASE_URL) go run ./cmd/api
+
+worker:
+	DATABASE_URL=$(DATABASE_URL) go run ./cmd/worker
+
+# Everything in Docker: db, migrate, small seed, api, worker, go test.
+test:
+	docker compose run --build --rm tests
