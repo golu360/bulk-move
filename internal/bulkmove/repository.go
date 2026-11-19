@@ -204,8 +204,14 @@ func newLeaseToken() (string, error) {
 
 // Claim takes the oldest claimable job and leases it to token for leaseTTL.
 // Claimable means: pending in a workspace with no running job, or running
-// with an expired lease (its worker died; resume it). Returns nil, nil when
-// nothing is claimable.
+// with an expired lease: its worker died (resume it), or it was released
+// after a failed chunk and its backoff is over (retry it). Returns nil, nil
+// when nothing is claimable.
+//
+// Taking over a lease that was never released (token still set) means the
+// previous worker died mid-attempt: that counts as one failed attempt, so a
+// job that kills its worker every time is eventually failed (the caller
+// checks ClaimedJob.Attempts) instead of being resumed forever.
 //
 // Isolation (one running job per workspace) is enforced twice: NOT EXISTS
 // filters candidates, and the partial unique index bulk_jobs_one_running
@@ -219,6 +225,8 @@ func (r *Repository) Claim(ctx context.Context, token string, leaseTTL time.Dura
 			lease_token      = @token,
 			lease_expires_at = now() + make_interval(secs => @lease_secs),
 			claims           = claims + 1,
+			attempts         = attempts + CASE WHEN status = 'running' AND lease_token IS NOT NULL
+			                                   THEN 1 ELSE 0 END,
 			started_at       = coalesce(started_at, now())
 		WHERE id = (
 			SELECT id FROM bulk_jobs c
@@ -229,9 +237,9 @@ func (r *Repository) Claim(ctx context.Context, token string, leaseTTL time.Dura
 			ORDER BY c.created_at, c.id
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED)
-		RETURNING id, workspace_id, target_stage_id`,
+		RETURNING id, workspace_id, target_stage_id, attempts, cursor_seq`,
 		pgx.NamedArgs{"token": token, "lease_secs": leaseTTL.Seconds()},
-	).Scan(&job.ID, &job.WorkspaceID, &job.TargetStageID)
+	).Scan(&job.ID, &job.WorkspaceID, &job.TargetStageID, &job.Attempts, &job.Cursor)
 
 	var pgErr *pgconn.PgError
 	switch {
@@ -296,7 +304,8 @@ func (r *Repository) ApplyChunk(ctx context.Context, job *ClaimedJob, cfg Config
 		if cursor >= total {
 			if _, err := tx.Exec(ctx, `
 				UPDATE bulk_jobs
-				SET status = 'completed', finished_at = now(), lease_token = NULL
+				SET status = 'completed', finished_at = now(), lease_token = NULL,
+				    attempts = 0, last_error = NULL
 				WHERE id = @job_id`, args); err != nil {
 				return fmt.Errorf("complete job: %w", err)
 			}
@@ -335,8 +344,9 @@ func (r *Repository) ApplyChunk(ctx context.Context, job *ClaimedJob, cfg Config
 		}
 		moved := int(tag.RowsAffected())
 
-		// 5. Advance the cursor, count, renew the lease, and complete the job
-		// if this was the last chunk — all in the same transaction.
+		// 5. Advance the cursor, count, renew the lease, reset the failed
+		// attempts, and complete the job if this was the last chunk — all in
+		// the same transaction.
 		finished = end == total
 		args["chunk_moved"], args["chunk_skipped"], args["finished"] = moved, (end-cursor)-moved, finished
 		if _, err := tx.Exec(ctx, `
@@ -345,6 +355,8 @@ func (r *Repository) ApplyChunk(ctx context.Context, job *ClaimedJob, cfg Config
 				moved            = moved + @chunk_moved,
 				skipped          = skipped + @chunk_skipped,
 				last_progress_at = now(),
+				attempts         = 0,
+				last_error       = NULL,
 				lease_expires_at = now() + make_interval(secs => @lease_secs),
 				status           = CASE WHEN @finished THEN 'completed' ELSE status END,
 				finished_at      = CASE WHEN @finished THEN now() ELSE finished_at END,
@@ -365,6 +377,36 @@ func (r *Repository) ApplyChunk(ctx context.Context, job *ClaimedJob, cfg Config
 		return false, err
 	}
 	return finished, nil
+}
+
+// ReleaseAfterFailure records a failed attempt at the job's current chunk.
+// Below maxAttempts it releases the lease with a backoff: the job stays
+// running (its workspace stays occupied) and any worker may claim it once
+// the backoff is over. At maxAttempts it marks the job failed. Fenced by
+// the lease token; returns the job's new status, or "" if the lease was
+// already lost (nothing written).
+func (r *Repository) ReleaseAfterFailure(ctx context.Context, job *ClaimedJob, reason string, backoff time.Duration, maxAttempts int) (string, error) {
+	var status string
+	err := r.db.QueryRow(ctx, `
+		UPDATE bulk_jobs SET
+			attempts         = attempts + 1,
+			last_error       = @reason,
+			lease_token      = NULL,
+			lease_expires_at = now() + make_interval(secs => @backoff_secs),
+			status           = CASE WHEN attempts + 1 >= @max THEN 'failed' ELSE status END,
+			finished_at      = CASE WHEN attempts + 1 >= @max THEN now() ELSE finished_at END
+		WHERE id = @job_id AND lease_token = @token
+		RETURNING status`,
+		pgx.NamedArgs{"job_id": job.ID, "token": job.Token, "reason": reason,
+			"backoff_secs": backoff.Seconds(), "max": maxAttempts},
+	).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("release after failure: %w", err)
+	}
+	return status, nil
 }
 
 // MarkFailed marks the job failed, fenced by the lease token so a replaced

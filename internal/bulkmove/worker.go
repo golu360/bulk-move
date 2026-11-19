@@ -29,10 +29,14 @@ type Config struct {
 	LeaseTTL time.Duration
 	// PollEvery is the sleep when nothing is claimable.
 	PollEvery time.Duration
-	// MaxChunkFailures consecutive failures of the same chunk mark the job
-	// failed; RetryBackoff is the sleep between attempts.
+	// MaxChunkFailures failed attempts at the same chunk mark the job
+	// failed. An attempt fails when the chunk returns an error, or when the
+	// worker dies holding the lease (counted when another worker takes the
+	// job over). Committed progress resets the count.
 	MaxChunkFailures int
-	RetryBackoff     time.Duration
+	// RetryBackoff: after a failed chunk the worker releases the job, and
+	// no worker may claim it again for this long.
+	RetryBackoff time.Duration
 }
 
 func DefaultConfig() Config {
@@ -122,10 +126,22 @@ func (w *Worker) loop(ctx context.Context, log *slog.Logger) {
 }
 
 // runJob applies chunks until the job completes, the lease is lost, the
-// context ends, or the same chunk fails MaxChunkFailures times in a row.
+// context ends, or a chunk fails. A failed chunk is not retried here: the
+// job is released with a backoff (or failed, at MaxChunkFailures) and any
+// worker, this one included, may claim it again once the backoff is over.
 func (w *Worker) runJob(ctx context.Context, job *ClaimedJob, log *slog.Logger) {
-	log.Info("job claimed")
-	failures := 0
+	log.Info("job claimed", "attempts", job.Attempts, "cursor", job.Cursor)
+	if job.Attempts >= w.cfg.MaxChunkFailures {
+		// Poison job: every worker that ran this chunk died holding the lease.
+		reason := fmt.Sprintf("abandoned %d times at item %d without progress (worker died or lost its lease each time)",
+			job.Attempts, job.Cursor)
+		if ok, err := w.repo.MarkFailed(ctx, job, reason); err != nil {
+			log.Error("mark failed", "error", err)
+		} else if ok {
+			log.Error("job failed", "reason", reason)
+		}
+		return
+	}
 	for {
 		done, err := w.repo.ApplyChunk(ctx, job, w.cfg)
 		switch {
@@ -133,7 +149,6 @@ func (w *Worker) runJob(ctx context.Context, job *ClaimedJob, log *slog.Logger) 
 			log.Info("job completed")
 			return
 		case err == nil:
-			failures = 0
 			if !sleep(ctx, w.cfg.ChunkPause) {
 				return
 			}
@@ -144,20 +159,16 @@ func (w *Worker) runJob(ctx context.Context, job *ClaimedJob, log *slog.Logger) 
 			log.Info("shutting down; in-flight chunk rolled back, job resumes after lease expiry")
 			return
 		default:
-			failures++
-			log.Warn("chunk failed", "error", err, "consecutive_failures", failures)
-			if failures >= w.cfg.MaxChunkFailures {
-				reason := fmt.Sprintf("chunk failed %d times in a row: %v", failures, err)
-				if ok, ferr := w.repo.MarkFailed(ctx, job, reason); ferr != nil {
-					log.Error("mark failed", "error", ferr)
-				} else if ok {
-					log.Error("job failed", "reason", reason)
-				}
-				return
+			status, ferr := w.repo.ReleaseAfterFailure(ctx, job, err.Error(), w.cfg.RetryBackoff, w.cfg.MaxChunkFailures)
+			switch {
+			case ferr != nil:
+				log.Error("release after failure", "error", ferr, "chunk_error", err)
+			case status == "failed":
+				log.Error("job failed", "reason", err, "attempts", w.cfg.MaxChunkFailures)
+			case status != "":
+				log.Warn("chunk failed; job released for retry", "error", err, "backoff", w.cfg.RetryBackoff)
 			}
-			if !sleep(ctx, w.cfg.RetryBackoff) {
-				return
-			}
+			return
 		}
 	}
 }

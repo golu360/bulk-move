@@ -333,16 +333,17 @@ func TestGracefulShutdownMidChunk(t *testing.T) {
 }
 
 // 31. Crash, make progress, crash again: each worker commits 5 chunks and
-// dies inside its 6th, four times over; the fifth worker finishes. Crashes
-// are not chunk failures: the job completes, is never marked failed, and
-// keeps no error.
+// dies inside its 6th, four times over; the fifth worker finishes. Each
+// crash is one failed attempt, but progress resets the count, so with a
+// limit of 2 the job still completes, is never marked failed, and keeps no
+// error.
 func TestRepeatedCrashesComplete(t *testing.T) {
 	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 3000) // 30 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
 	cfg := testConfig()
-	cfg.MaxChunkFailures = 1 // a crash counted as a failure would fail the job at once
+	cfg.MaxChunkFailures = 2 // 4 crashes in total: fails unless progress resets the count
 
 	stopWatch := watchProgress(t, pool, jobID)
 	for crash := 1; crash <= 4; crash++ {

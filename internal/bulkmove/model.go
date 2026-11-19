@@ -28,6 +28,10 @@ type ClaimedJob struct {
 	WorkspaceID   int64
 	TargetStageID int64
 	Token         string
+	// Attempts is the number of failed attempts at the current chunk,
+	// including the one this claim just took over from a dead worker.
+	Attempts int
+	Cursor   int // items processed when claimed
 }
 
 // Filter selects the deals to move. Every field is optional; an empty

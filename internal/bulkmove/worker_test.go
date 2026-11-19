@@ -155,6 +155,7 @@ type jobState struct {
 	LeaseToken, LastError                 *string
 	StartedAt, FinishedAt                 *time.Time
 	TargetStageID                         int64
+	Attempts                              int
 }
 
 func loadJob(t testing.TB, pool *pgxpool.Pool, id int64) jobState {
@@ -162,10 +163,10 @@ func loadJob(t testing.TB, pool *pgxpool.Pool, id int64) jobState {
 	var j jobState
 	if err := pool.QueryRow(context.Background(), `
 		SELECT status, total, cursor_seq, moved, skipped, claims, lease_token, last_error,
-		       started_at, finished_at, target_stage_id
+		       started_at, finished_at, target_stage_id, attempts
 		FROM bulk_jobs WHERE id = $1`, id).Scan(
 		&j.Status, &j.Total, &j.Cursor, &j.Moved, &j.Skipped, &j.Claims, &j.LeaseToken,
-		&j.LastError, &j.StartedAt, &j.FinishedAt, &j.TargetStageID); err != nil {
+		&j.LastError, &j.StartedAt, &j.FinishedAt, &j.TargetStageID, &j.Attempts); err != nil {
 		t.Fatal(err)
 	}
 	return j
@@ -405,38 +406,67 @@ func TestWorkerShutdownThenRestart(t *testing.T) {
 // 2. Retrying a chunk
 // ---------------------------------------------------------------------------
 
-// A chunk that fails transiently is rolled back and retried by the same
-// worker; the retry must not double-apply anything.
+// 38. Transient failures: chunk 3 fails its first 2 attempts, and so
+// does chunk 6. Each failure rolls back, releases the job, and the retry
+// succeeds with nothing doubled. The limit is 3 failed attempts per chunk:
+// 4 failures in all would exceed it, so the job completes only because
+// chunk 3's success reset the count (attempts at chunk 6's retry is 2,
+// not 4).
 func TestChunkRetryAfterTransientFailure(t *testing.T) {
 	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 1000) // 10 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
+	cfg := testConfig()
+	cfg.MaxChunkFailures = 3
 
+	var (
+		mu       sync.Mutex
+		calls    int
+		attempts = map[int]int{} // call number → committed attempts when it ran
+	)
 	repo := NewRepository(pool)
-	var calls atomic.Int32
 	repo.beforeCommit = func() error {
-		// Attempts 3 and 4 are both chunk 3 (a failed chunk doesn't advance).
-		if n := calls.Add(1); n == 3 || n == 4 {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		var a int
+		if err := pool.QueryRow(context.Background(), `SELECT attempts FROM bulk_jobs WHERE id = $1`, jobID).Scan(&a); err != nil {
+			return err
+		}
+		attempts[calls] = a
+		// Calls 3, 4, 5 are chunk 3; calls 8, 9, 10 are chunk 6.
+		if calls == 3 || calls == 4 || calls == 8 || calls == 9 {
 			return errors.New("injected transient failure")
 		}
 		return nil
 	}
-	startWorker(t, newWorker(t, repo, testConfig()))
+	startWorker(t, newWorker(t, repo, cfg))
 	waitFor(t, 30*time.Second, "job completed", statusIs(t, pool, jobID, "completed"))
 
 	j := assertCompleted(t, pool, jobID)
-	if j.Moved != 1000 || j.Skipped != 0 || j.Claims != 1 || j.LastError != nil {
-		t.Fatalf("job = %+v, want moved=1000 skipped=0 claims=1 no last_error", j)
+	if j.Moved != 1000 || j.Skipped != 0 || j.LastError != nil || j.Attempts != 0 {
+		t.Fatalf("job = %+v, want moved=1000 skipped=0, attempts and last_error cleared", j)
 	}
-	if got := calls.Load(); got != 12 {
-		t.Fatalf("chunk attempts = %d, want 12 (10 chunks + 2 retries)", got)
+	if j.Claims != 5 {
+		t.Fatalf("claims = %d, want 5 (first claim + one per failure)", j.Claims)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 14 {
+		t.Fatalf("chunk attempts = %d, want 14 (10 chunks + 4 retries)", calls)
+	}
+	for call, want := range map[int]int{3: 0, 4: 1, 5: 2, 6: 0, 8: 0, 9: 1, 10: 2} {
+		if attempts[call] != want {
+			t.Fatalf("attempts seen by call %d = %d, want %d (all: %v)", call, attempts[call], want, attempts)
+		}
 	}
 }
 
-// A chunk that keeps failing marks the job failed after MaxChunkFailures,
-// keeps the committed progress, releases the lease, and is never claimed
-// again. The workspace is then free for its next job.
+// 39. A chunk that keeps failing marks the job failed after
+// MaxChunkFailures attempts, with last_error set; it keeps the committed
+// progress, releases the lease, and is never claimed again. The workspace
+// is then free for its next job.
 func TestChunkRetryExhaustedMarksJobFailed(t *testing.T) {
 	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
@@ -461,8 +491,8 @@ func TestChunkRetryExhaustedMarksJobFailed(t *testing.T) {
 	stop()
 
 	j := loadJob(t, pool, jobID)
-	if j.Cursor != 200 || j.Moved != 200 || j.LeaseToken != nil || j.FinishedAt == nil || j.Claims != 1 {
-		t.Fatalf("failed job = %+v, want cursor=moved=200, no lease, finished, claims=1", j)
+	if j.Cursor != 200 || j.Moved != 200 || j.LeaseToken != nil || j.FinishedAt == nil || j.Claims != 3 || j.Attempts != 3 {
+		t.Fatalf("failed job = %+v, want cursor=moved=200, no lease, finished, claims=3, attempts=3", j)
 	}
 	if j.LastError == nil || !strings.Contains(*j.LastError, "injected persistent failure") {
 		t.Fatalf("last_error = %v", j.LastError)
@@ -477,7 +507,7 @@ func TestChunkRetryExhaustedMarksJobFailed(t *testing.T) {
 	startWorker(t, newWorker(t, NewRepository(pool), cfg))
 	waitFor(t, 30*time.Second, "second job completed", statusIs(t, pool, job2, "completed"))
 	assertCompleted(t, pool, job2)
-	if j := loadJob(t, pool, jobID); j.Status != "failed" || j.Claims != 1 {
+	if j := loadJob(t, pool, jobID); j.Status != "failed" || j.Claims != 3 {
 		t.Fatalf("failed job was reclaimed: %+v", j)
 	}
 }
@@ -521,8 +551,9 @@ func TestChunkRetryOnLockTimeout(t *testing.T) {
 
 	waitFor(t, 30*time.Second, "job completed", statusIs(t, pool, jobID, "completed"))
 	j := assertCompleted(t, pool, jobID)
-	if j.Moved != 999 || j.Skipped != 1 || j.Claims != 1 {
-		t.Fatalf("moved=%d skipped=%d claims=%d, want 999/1/1", j.Moved, j.Skipped, j.Claims)
+	// Each lock timeout released the job and it was claimed again.
+	if j.Moved != 999 || j.Skipped != 1 || j.Claims < 2 || j.Attempts != 0 {
+		t.Fatalf("moved=%d skipped=%d claims=%d attempts=%d, want 999/1/>=2/0", j.Moved, j.Skipped, j.Claims, j.Attempts)
 	}
 	if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE id = $1 AND stage_id = $2`, first, s3); n != 1 {
 		t.Fatal("user's edit was overwritten")

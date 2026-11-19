@@ -22,15 +22,16 @@ import (
 // ---------------------------------------------------------------------------
 
 // committedState fingerprints everything a chunk could write, as other
-// sessions see it: the job row (progress, counters, lease), every deal
-// (stage, version, updated_at) and the transitions table (row count and
-// highest id). Equal fingerprints = nothing committed in between.
+// sessions see it: the job's progress (cursor, counters, status,
+// last_progress_at), every deal (stage, version, updated_at) and the
+// transitions table (row count and highest id). Equal fingerprints = no
+// chunk committed in between. Lease, attempts and last_error are left out:
+// releasing a failed job for retry legitimately writes them.
 func committedState(ctx context.Context, pool *pgxpool.Pool, jobID int64) (string, error) {
 	var s string
 	err := pool.QueryRow(ctx, `
 		SELECT md5(
-		  (SELECT row(cursor_seq, moved, skipped, status, lease_token, lease_expires_at,
-		              last_progress_at, last_error)::text
+		  (SELECT row(cursor_seq, moved, skipped, status, last_progress_at)::text
 		   FROM bulk_jobs WHERE id = $1)
 		  || '|' || (SELECT coalesce(string_agg(id || ':' || stage_id || ':' || version || ':' || updated_at,
 		                                       ',' ORDER BY id), '') FROM opportunities)
@@ -40,8 +41,8 @@ func committedState(ctx context.Context, pool *pgxpool.Pool, jobID int64) (strin
 }
 
 // 34. An error just before COMMIT (all of chunk 3's writes done) leaves no
-// trace: the committed state when the worker retries chunk 3 is exactly
-// the state before the failed attempt. The worker's own retry then
+// trace: the committed state when chunk 3 is retried is exactly the state
+// before the failed attempt. The retry (a fresh claim after the backoff)
 // succeeds and the job completes with nothing doubled.
 //
 // Both fingerprints are taken from inside the chunk transaction (the hook)
@@ -89,16 +90,16 @@ func TestErrorBeforeCommitLeavesNoTrace(t *testing.T) {
 		t.Fatalf("chunk attempts = %d, want 11 (10 chunks + 1 retry)", calls)
 	}
 	j := assertCompleted(t, pool, jobID)
-	if j.Moved != 1000 || j.Skipped != 0 || j.Claims != 1 || j.LastError != nil {
-		t.Fatalf("job = %+v, want moved=1000 skipped=0 claims=1 no last_error", j)
+	if j.Moved != 1000 || j.Skipped != 0 || j.Claims != 2 || j.LastError != nil || j.Attempts != 0 {
+		t.Fatalf("job = %+v, want moved=1000 skipped=0 claims=2 (retry), attempts and last_error cleared", j)
 	}
 }
 
 // 35. The worker's database connection is killed (pg_terminate_backend)
 // while chunk 3 is open with all its writes done. The server aborts the
 // transaction: nothing of chunk 3 is committed. The worker sees the commit
-// fail, retries on a fresh pooled connection, and the job completes with
-// every deal moved exactly once, by the same worker (no takeover).
+// fail, releases the job for retry, claims it again on a fresh pooled
+// connection, and the job completes with every deal moved exactly once.
 func TestConnectionKilledMidChunk(t *testing.T) {
 	pool := newDB(t)
 	ctx := context.Background()
@@ -165,8 +166,8 @@ func TestConnectionKilledMidChunk(t *testing.T) {
 
 	waitFor(t, 30*time.Second, "job completed", statusIs(t, pool, jobID, "completed"))
 	j := assertCompleted(t, pool, jobID)
-	if j.Moved != 1000 || j.Skipped != 0 || j.Claims != 1 || j.LastError != nil {
-		t.Fatalf("job = %+v, want moved=1000 skipped=0 claims=1 no last_error", j)
+	if j.Moved != 1000 || j.Skipped != 0 || j.Claims != 2 || j.LastError != nil || j.Attempts != 0 {
+		t.Fatalf("job = %+v, want moved=1000 skipped=0 claims=2 (retry), attempts and last_error cleared", j)
 	}
 	mu.Lock()
 	defer mu.Unlock()
