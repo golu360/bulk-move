@@ -116,9 +116,9 @@ func bulkTransitions(t testing.TB, pool *pgxpool.Pool, jobID int64) int {
 	return count(t, pool, `SELECT count(*) FROM stage_transitions WHERE bulk_job_id = $1`, jobID)
 }
 
-// assertCompleted checks the invariants scripts/verify-job.sql will check:
-// completed, every item accounted for, one transition per moved deal, no
-// deal moved twice, and each moved deal's history agrees with its state.
+// assertCompleted checks the job finished correctly: completed, every item
+// accounted for, one transition per moved deal, no deal moved twice, and
+// each moved deal's history agrees with its state.
 func assertCompleted(t testing.TB, pool *pgxpool.Pool, jobID int64) jobState {
 	t.Helper()
 	j := loadJob(t, pool, jobID)
@@ -262,8 +262,30 @@ func TestWorkerCrashMidChunkThenResume(t *testing.T) {
 				t.Fatalf("deals in target after crash = %d, want %d (uncommitted chunk leaked)", n, want)
 			}
 
-			// Worker B: a fresh process. Resumes once A's lease expires.
+			// Worker B: a fresh process. Resumes once A's lease expires, and
+			// not before: while the DB clock is before A's expiry, claims
+			// must stay 1 (read in the same statement, so no race).
+			var aExpires time.Time
+			if err := pool.QueryRow(context.Background(),
+				`SELECT lease_expires_at FROM bulk_jobs WHERE id = $1`, jobID).Scan(&aExpires); err != nil {
+				t.Fatal(err)
+			}
 			stop := startWorker(t, newWorker(t, NewRepository(pool), cfg))
+			for {
+				var claims int
+				var leased bool
+				if err := pool.QueryRow(context.Background(),
+					`SELECT claims, now() < $2 FROM bulk_jobs WHERE id = $1`, jobID, aExpires).Scan(&claims, &leased); err != nil {
+					t.Fatal(err)
+				}
+				if !leased {
+					break
+				}
+				if claims != 1 {
+					t.Fatalf("worker B claimed the job while A's lease was still valid (claims=%d)", claims)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 			waitFor(t, 30*time.Second, "job completed by worker B", statusIs(t, pool, jobID, "completed"))
 			stop()
 

@@ -69,7 +69,7 @@ type JobStatus struct {
 	FinishedAt    *time.Time `json:"finished_at"`
 }
 
-var validStatuses =map[string]bool{"open": true, "won": true, "lost": true, "abandoned": true}
+var validStatuses = map[string]bool{"open": true, "won": true, "lost": true, "abandoned": true}
 
 func invalid(format string, a ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrInvalidFilter}, a...)...)
