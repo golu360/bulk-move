@@ -503,3 +503,30 @@ func TestMoveBusyWhenRowLocked(t *testing.T) {
 		t.Fatalf("transitions = %d, want 0", n)
 	}
 }
+
+// Manual move to the deal's CURRENT stage, twice: 200 both times, the deal
+// is returned unchanged, and no transition or version bump is written.
+func TestMoveToCurrentStageTwiceWritesNothing(t *testing.T) {
+	pool := testdb.New(t)
+	app := newApp(pool)
+	wsID, stageID := seedWorkspace(t, pool, "A")
+	id := insertOpps(t, pool, wsID, stageID, 1)[0]
+
+	for i := range 2 {
+		resp, raw := postJSON(t, app, fmt.Sprintf("/opportunities/%d/move", id), fmt.Sprint(wsID),
+			fmt.Sprintf(`{"stage_id":%d}`, stageID))
+		if resp.StatusCode != 200 {
+			t.Fatalf("move %d: status %d; body=%s", i+1, resp.StatusCode, raw)
+		}
+		var o opportunity.Opportunity
+		if err := json.Unmarshal(raw, &o); err != nil {
+			t.Fatal(err)
+		}
+		if o.StageID != stageID || o.Version != 0 || !o.UpdatedAt.Equal(o.CreatedAt) {
+			t.Fatalf("move %d changed the deal: %+v", i+1, o)
+		}
+	}
+	if n := len(transitions(t, pool, id)); n != 0 {
+		t.Fatalf("transitions = %d, want 0", n)
+	}
+}

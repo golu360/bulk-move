@@ -157,6 +157,9 @@ func TestSubmitHandlerErrors(t *testing.T) {
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, raw)
 			}
+			if h := resp.Header.Get(ReplayedHeader); h != "" {
+				t.Fatalf("error response carries %s=%q", ReplayedHeader, h)
+			}
 			var eb errBody
 			if err := json.Unmarshal(raw, &eb); err != nil {
 				t.Fatalf("decode: %v; body=%s", err, raw)

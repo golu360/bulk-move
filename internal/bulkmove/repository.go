@@ -116,16 +116,17 @@ func (r *Repository) CreateJobWithSnapshot(ctx context.Context, workspaceID int6
 		if errors.Is(err, pgx.ErrNoRows) {
 			var storedHash []byte
 			if err := tx.QueryRow(ctx, `
-				SELECT id, request_hash, total FROM bulk_jobs
+				SELECT id, request_hash, status, total FROM bulk_jobs
 				WHERE workspace_id = @workspace_id AND idempotency_key = @idempotency_key`,
-				args).Scan(&job.ID, &storedHash, &job.Total); err != nil {
+				args).Scan(&job.ID, &storedHash, &job.Status, &job.Total); err != nil {
 				return fmt.Errorf("load existing job: %w", err)
 			}
 			if !bytes.Equal(storedHash, requestHash) {
 				return ErrKeyReused
 			}
-			// A replay returns the same answer the original submit did.
-			job.Status = "pending"
+			// A replay is the same job with its CURRENT status. It never
+			// restarts the job: a failed or completed job stays as it is.
+			// To run the same move again, submit with a new key.
 			return nil
 		}
 		if err != nil {
