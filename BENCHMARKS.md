@@ -22,7 +22,7 @@ Re-seeds the database first. Stop your own API and worker before running.
 <details>
 <summary><b>Hardware</b></summary>
 
-- Apple M4 Pro, 12 cores, 24 GB RAM, macOS 15.7.4
+- Apple M4 Pro, 12 cores, 24 GB RAM 
 - Postgres 16.16 in Docker Desktop (12 CPUs, 7.7 GB)
 - Go 1.26.0; API, worker and bench run on the host
 
