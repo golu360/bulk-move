@@ -87,8 +87,9 @@ func NewWorker(repo *Repository, cfg Config, log *slog.Logger) (*Worker, error) 
 }
 
 // Run blocks until ctx is cancelled and every loop has returned. On
-// cancellation an in-flight chunk rolls back; its lease is not released, so
-// another worker resumes the job after LeaseTTL.
+// cancellation an in-flight chunk rolls back and the job is released without
+// counting a failed attempt, so another worker can resume it at once. If the
+// release fails, the job resumes after LeaseTTL.
 func (w *Worker) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i := range w.cfg.Workers {
@@ -150,13 +151,14 @@ func (w *Worker) runJob(ctx context.Context, job *ClaimedJob, log *slog.Logger) 
 			return
 		case err == nil:
 			if !sleep(ctx, w.cfg.ChunkPause) {
+				w.releaseOnShutdown(ctx, job, log)
 				return
 			}
 		case errors.Is(err, ErrLeaseLost):
 			log.Warn("lease lost; another worker owns the job")
 			return
 		case ctx.Err() != nil:
-			log.Info("shutting down; in-flight chunk rolled back, job resumes after lease expiry")
+			w.releaseOnShutdown(ctx, job, log)
 			return
 		default:
 			status, ferr := w.repo.ReleaseAfterFailure(ctx, job, err.Error(), w.cfg.RetryBackoff, w.cfg.MaxChunkFailures)
@@ -170,6 +172,26 @@ func (w *Worker) runJob(ctx context.Context, job *ClaimedJob, log *slog.Logger) 
 			}
 			return
 		}
+	}
+}
+
+// shutdownReleaseTimeout bounds the release on shutdown. If it does not
+// finish in time, the job still resumes after LeaseTTL.
+const shutdownReleaseTimeout = 5 * time.Second
+
+// releaseOnShutdown hands the job back after ctx was cancelled. Any
+// in-flight chunk has already rolled back. It runs on a fresh context
+// because ctx is done.
+func (w *Worker) releaseOnShutdown(ctx context.Context, job *ClaimedJob, log *slog.Logger) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownReleaseTimeout)
+	defer cancel()
+	switch ok, err := w.repo.ReleaseOnShutdown(rctx, job); {
+	case err != nil:
+		log.Error("shutting down; release failed, job resumes after lease expiry", "error", err)
+	case ok:
+		log.Info("shutting down; job released, any worker may resume it now")
+	default:
+		log.Info("shutting down; lease already lost, nothing to release")
 	}
 }
 

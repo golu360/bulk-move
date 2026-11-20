@@ -34,6 +34,7 @@ Every write is fenced with `WHERE lease_token = @token`. A committed chunk renew
 **Failures.**
 - A chunk that errors releases the job: the token is set to NULL, `attempts` goes up by 1, and the lease is set to `now() + RetryBackoff`. Any worker may retry it once the backoff is over.
 - A takeover from a dead worker also counts as an attempt.
+- A graceful shutdown (SIGTERM) is not a failure. The in-flight chunk rolls back, and the worker sets the token to NULL and the lease to `now()` without touching `attempts`. Any worker may resume the job at once. If that release fails, the job resumes after `LeaseTTL`, as for a dead worker.
 - Committed progress resets `attempts` to 0.
 - At `MaxChunkFailures` failed attempts without progress, the job is marked `failed`. A chunk that kills its worker every time therefore ends as a failed job and is not resumed forever.
 

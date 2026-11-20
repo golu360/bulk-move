@@ -409,6 +409,23 @@ func (r *Repository) ReleaseAfterFailure(ctx context.Context, job *ClaimedJob, r
 	return status, nil
 }
 
+// ReleaseOnShutdown hands the job back on a graceful shutdown: the token is
+// cleared and the lease expires now, so any worker may claim it at once.
+// Unlike ReleaseAfterFailure it does not count an attempt, and because the
+// token is NULL, Claim does not count the takeover as one either. Fenced by
+// the lease token; returns whether the job was released (false if the lease
+// was already lost or the job finished).
+func (r *Repository) ReleaseOnShutdown(ctx context.Context, job *ClaimedJob) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE bulk_jobs SET lease_token = NULL, lease_expires_at = now()
+		WHERE id = @job_id AND lease_token = @token AND status = 'running'`,
+		pgx.NamedArgs{"job_id": job.ID, "token": job.Token})
+	if err != nil {
+		return false, fmt.Errorf("release on shutdown: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // MarkFailed marks the job failed, fenced by the lease token so a replaced
 // worker cannot fail a job someone else is now running. Returns whether the
 // job was updated.

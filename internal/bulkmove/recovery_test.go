@@ -277,15 +277,18 @@ func TestCrashAtEndOfJob(t *testing.T) {
 }
 
 // 30. Graceful shutdown (SIGTERM cancels the worker's context) while a
-// chunk is in flight: that chunk rolls back, the lease is kept (not
-// released), and a restarted worker redoes exactly that chunk and finishes.
-// Deterministic: the hook parks chunk 10 until the context is cancelled.
+// chunk is in flight: that chunk rolls back, the job is released without a
+// failed attempt, and a restarted worker claims it at once (the lease is a
+// minute, longer than the test waits), redoes exactly that chunk and
+// finishes. Deterministic: the hook parks chunk 10 until the context is
+// cancelled.
 func TestGracefulShutdownMidChunk(t *testing.T) {
 	pool := newDB(t)
 	ws, s1, s2 := seedWorkspace(t, pool, "A")
 	insertOpps(t, pool, ws, s1, 3000) // 30 chunks
 	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
 	cfg := testConfig()
+	cfg.LeaseTTL = time.Minute // a restart that waited for expiry would time out
 
 	repoA := NewRepository(pool)
 	inChunk, release := make(chan struct{}), make(chan struct{})
@@ -315,8 +318,8 @@ func TestGracefulShutdownMidChunk(t *testing.T) {
 	}
 
 	j := loadJob(t, pool, jobID)
-	if j.Status != "running" || j.Cursor != 900 || j.Moved != 900 || j.LeaseToken == nil || j.LastError != nil {
-		t.Fatalf("after shutdown: %+v, want running, cursor=moved=900 (chunk 10 rolled back), lease kept, no error", j)
+	if j.Status != "running" || j.Cursor != 900 || j.Moved != 900 || j.LeaseToken != nil || j.Attempts != 0 || j.LastError != nil {
+		t.Fatalf("after shutdown: %+v, want running, cursor=moved=900 (chunk 10 rolled back), lease released, no attempt counted, no error", j)
 	}
 	assertTransitionsMatch(t, pool, jobID, j)
 	if n := count(t, pool, `SELECT count(*) FROM opportunities WHERE stage_id = $1`, s2); n != 900 {
@@ -329,6 +332,53 @@ func TestGracefulShutdownMidChunk(t *testing.T) {
 	j = assertCompleted(t, pool, jobID)
 	if j.Moved != 3000 || j.Claims != 2 || chunksB.Load() != 21 {
 		t.Fatalf("moved=%d claims=%d chunks=%d, want 3000/2/21", j.Moved, j.Claims, chunksB.Load())
+	}
+}
+
+// 30b. ReleaseOnShutdown at the repository level: it keeps the attempts
+// already counted (it neither adds one nor clears them), the next Claim
+// succeeds immediately and does not count the takeover as a failed attempt,
+// and a stale token releases nothing.
+func TestReleaseOnShutdownKeepsAttemptsAndIsFenced(t *testing.T) {
+	pool := newDB(t)
+	ctx := context.Background()
+	ws, s1, s2 := seedWorkspace(t, pool, "A")
+	insertOpps(t, pool, ws, s1, 300)
+	jobID := submitJob(t, pool, ws, "k", Filter{StageID: &s1}, s2)
+	repo := NewRepository(pool)
+
+	a, err := repo.Claim(ctx, "token-a", time.Minute)
+	if err != nil || a == nil {
+		t.Fatalf("claim a: %v, %v", a, err)
+	}
+	// Two earlier failed attempts at this chunk.
+	if _, err := pool.Exec(ctx, `UPDATE bulk_jobs SET attempts = 2 WHERE id = $1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := repo.ReleaseOnShutdown(ctx, a)
+	if err != nil || !ok {
+		t.Fatalf("release: ok=%v err=%v, want released", ok, err)
+	}
+	if j := loadJob(t, pool, jobID); j.Status != "running" || j.LeaseToken != nil || j.Attempts != 2 {
+		t.Fatalf("after release: %+v, want running, no token, attempts=2", j)
+	}
+
+	// Claimable at once, although token-a's lease had a minute left.
+	b, err := repo.Claim(ctx, "token-b", time.Minute)
+	if err != nil || b == nil {
+		t.Fatalf("claim b right after release: %v, %v", b, err)
+	}
+	if b.Attempts != 2 {
+		t.Fatalf("attempts after takeover = %d, want 2 (a clean release is not a failure)", b.Attempts)
+	}
+
+	// The old token is fenced out: it releases nothing.
+	if ok, err := repo.ReleaseOnShutdown(ctx, a); err != nil || ok {
+		t.Fatalf("stale release: ok=%v err=%v, want nothing released", ok, err)
+	}
+	if j := loadJob(t, pool, jobID); j.LeaseToken == nil || *j.LeaseToken != "token-b" {
+		t.Fatalf("token = %v, want token-b untouched", j.LeaseToken)
 	}
 }
 
