@@ -127,7 +127,7 @@ curl -X POST localhost:8080/opportunities/42/move -H "$H" -H "$J" -d '{"stage_id
 
 Returns the updated opportunity with `version` incremented. Moving it to the stage it is already in changes nothing. Errors: `404` if the opportunity is not in this workspace, `422` if the stage is not, and `503` with `Retry-After: 1` if another request is changing the same deal.
 
-### List a stage
+### List opportunities in a stage
 
 ```sh
 curl 'localhost:8080/stages/1/opportunities?limit=50' -H "$H"
