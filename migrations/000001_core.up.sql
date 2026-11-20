@@ -39,4 +39,3 @@ CREATE TABLE stage_transitions (
   bulk_job_id    bigint,
   created_at     timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX stage_transitions_opp ON stage_transitions (opportunity_id, created_at);
